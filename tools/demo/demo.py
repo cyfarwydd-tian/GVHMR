@@ -302,6 +302,121 @@ def render_global(cfg):
         writer.write_frame(img)
     writer.close()
 
+def _np(x):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
+def _aa_flat(x, T=None):
+    """
+    把 (T, J, 3) 或 (T, 3) 或 (J, 3) / (3,) 的轴角统一成 (T, 3*J) / (T, 3)。
+    若是常量（无 T 维），会按 T 重复。
+    """
+    x = _np(x)
+    if x.ndim == 1:  # (3,) or (K,)
+        assert T is not None, "Need T to tile a static vector"
+        x = np.tile(x[None, ...], (T, 1))
+        return x
+    if x.ndim == 2:  # (T, 3) 或 (J, 3)
+        if x.shape[1] == 3 and (T is None or x.shape[0] == T):
+            return x  # (T, 3)
+        if x.shape[1] == 3 and T is not None and x.shape[0] != T:
+            # (J,3) 常量，按 T 重复
+            x = np.tile(x[None, ...], (T, 1, 1))  # (T,J,3)
+            return x.reshape(T, -1)
+    if x.ndim == 3:  # (T, J, 3)
+        T_ = x.shape[0]
+        return x.reshape(T_, -1)
+    raise ValueError(f"Unexpected axis-angle shape: {x.shape}")
+
+def save_smplx_npz_for_gmr(cfg, which="incam", out_basename=None):
+    """
+    导出为 GMR 期望的“扁平 .npz”：
+      必备键： gender, betas, pose_body, root_orient, trans
+      可选键： pose_hand (L+R), jaw_pose, leye_pose, reye_pose, expression, mocap_framerate
+    字段均为 float32（除了 gender 为字符串）。
+    """
+    assert which in ("incam", "global")
+    results_path = cfg.paths.hmr4d_results
+    assert Path(results_path).exists(), f"Results not found at {results_path}"
+    pred = torch.load(results_path, map_location="cpu")
+
+    params_key = "smpl_params_incam" if which == "incam" else "smpl_params_global"
+    assert params_key in pred, f"{params_key} not in prediction results"
+    P = pred[params_key]  # dict of tensors
+
+    # 推断帧数 T
+    # 优先从 global_orient / body_pose / transl 推断
+    T = None
+    for k in ["global_orient", "body_pose", "transl", "left_hand_pose", "right_hand_pose"]:
+        if k in P:
+            arr = _np(P[k])
+            if arr.ndim >= 2:
+                T = arr.shape[0]
+                break
+    if T is None:
+        raise RuntimeError("Cannot infer sequence length T from SMPL-X params.")
+
+    # 必备字段
+    # gender（很多检测模型不给性别，这里默认 neutral；GMR 会用它构建 body_model）
+    gender = P.get("gender", "neutral")
+    if isinstance(gender, (np.ndarray, torch.Tensor)):
+        gender = str(np.array(gender).item())  # 变成纯字符串
+    else:
+        gender = str(gender)
+
+    # betas：若为 (T,B) 则取第 1 帧；若为 (B,) 直接用
+    betas = P.get("betas", None)
+    if betas is None:
+        betas_np = np.zeros((16,), dtype=np.float32)  # 兜底 16 维
+    else:
+        b = _np(betas)
+        if b.ndim == 2:  # (T,B)
+            b = b[0]
+        betas_np = b.astype(np.float32)
+
+    # root_orient, pose_body, trans —— GMR 的命名
+    # 我们从 HMR4D 的命名映射：global_orient -> root_orient；body_pose -> pose_body；transl -> trans
+    root_orient_np = _aa_flat(P.get("global_orient", np.zeros((T, 3), np.float32)), T).astype(np.float32)
+    pose_body_np   = _aa_flat(P.get("body_pose",      np.zeros((T, 21, 3), np.float32)), T).astype(np.float32)
+    trans_np       = _np(P.get("transl", np.zeros((T, 3), np.float32))).astype(np.float32)
+
+    # 手部：GMR 常用单键 pose_hand=(T,90)（L(45)+R(45)）
+    lh = P.get("left_hand_pose",  np.zeros((T, 15, 3), np.float32))
+    rh = P.get("right_hand_pose", np.zeros((T, 15, 3), np.float32))
+    pose_hand_np = np.concatenate([_aa_flat(lh, T), _aa_flat(rh, T)], axis=1).astype(np.float32)  # (T,90)
+
+    # 面部（可选，很多下游不用，给 0 即可）
+    jaw_pose_np  = _aa_flat(P.get("jaw_pose",  np.zeros((T, 1, 3), np.float32)), T).astype(np.float32)   # (T,3)
+    leye_pose_np = _aa_flat(P.get("leye_pose", np.zeros((T, 1, 3), np.float32)), T).astype(np.float32)   # (T,3)
+    reye_pose_np = _aa_flat(P.get("reye_pose", np.zeros((T, 1, 3), np.float32)), T).astype(np.float32)   # (T,3)
+    expr = P.get("expression", np.zeros((T, 10), np.float32))  # 常见 10 维
+    expression_np = _np(expr).astype(np.float32)
+    if expression_np.ndim == 1:  # (10,) -> (T,10)
+        expression_np = np.tile(expression_np[None, :], (T, 1)).astype(np.float32)
+
+    out = {
+        "gender": np.array(gender),
+        "betas": betas_np,
+        "pose_body": pose_body_np,      # (T,63)
+        "root_orient": root_orient_np,  # (T,3)
+        "trans": trans_np,              # (T,3)
+        "pose_hand": pose_hand_np,      # (T,90)
+        "jaw_pose": jaw_pose_np,        # (T,3)
+        "leye_pose": leye_pose_np,      # (T,3)
+        "reye_pose": reye_pose_np,      # (T,3)
+        "expression": expression_np,    # (T,10)
+        "mocap_framerate": np.array(30, dtype=np.int32),
+    }
+
+    # 文件名
+    if out_basename is None:
+        out_basename = f"{cfg.video_name}_smplx_{which}.npz"
+    out_path = Path(cfg.output_dir) / out_basename
+    np.savez(out_path, **out)
+    Log.info(f"[Save SMPL-X for GMR] {which} saved -> {out_path}")
+
+
 
 if __name__ == "__main__":
     cfg = parse_args_to_cfg()
@@ -325,10 +440,11 @@ if __name__ == "__main__":
         data_time = data["length"] / 30
         Log.info(f"[HMR4D] Elapsed: {Log.sync_time() - tic:.2f}s for data-length={data_time:.1f}s")
         torch.save(pred, paths.hmr4d_results)
-
+    
+    save_smplx_npz_for_gmr(cfg, which="global")
     # ===== Render ===== #
     render_incam(cfg)
     render_global(cfg)
-    if not Path(paths.incam_global_horiz_video).exists():
-        Log.info("[Merge Videos]")
-        merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
+    #if not Path(paths.incam_global_horiz_video).exists():
+        #Log.info("[Merge Videos]")
+        #merge_videos_horizontal([paths.incam_video, paths.global_video], paths.incam_global_horiz_video)
